@@ -229,19 +229,36 @@ function byId(id){ return DATA.find(q=>q.id===id); }
 
 /* ================= Multiple Choice ================= */
 const OPT_MAXLEN = 260;   // einheitlich kürzen, damit die Länge nichts verrät
-function optText(qid){
+function optText(qid, full){
   const t = byId(qid).a.replace(/\s+/g,' ').trim();
-  return t.length > OPT_MAXLEN ? t.slice(0, OPT_MAXLEN).trimEnd()+' …' : t;
+  if(full) return byId(qid).a;
+  return t.length > OPT_MAXLEN ? t.slice(0, OPT_MAXLEN).trimEnd()+' … (antippen zum Aufklappen)' : t;
+}
+const _tokCache = {};
+function toks(qid){
+  if(!_tokCache[qid]){
+    const t = byId(qid).a.toLowerCase().match(/[a-zäöüß§][a-zäöüß§0-9-]{4,}/g) || [];
+    _tokCache[qid] = new Set(t);
+  }
+  return _tokCache[qid];
 }
 function buildOptions(id){
-  // 3 Ablenker: bevorzugt thematisch benachbarte Fragen (der Katalog ist nach Themen gruppiert)
-  const me = parseInt(id, 10);
-  const candidates = pool().filter(q=>q.id!==id)
-    .sort((a,b)=>Math.abs(parseInt(a.id,10)-me)-Math.abs(parseInt(b.id,10)-me));
-  const near = shuffle(candidates.slice(0, 12)).slice(0, 3).map(q=>q.id);
-  return shuffle([id].concat(near));
+  /* 3 Ablenker, möglichst schwer: thematische Nähe (ID-Abstand, der Katalog ist
+     nach Themen gruppiert) + Wortüberlappung mit der richtigen Antwort +
+     ähnliche Antwortlänge. Aus den 10 besten werden 3 zufällig gezogen. */
+  const me = parseInt(id, 10), myLen = byId(id).a.length, myT = toks(id);
+  const scored = pool().filter(q=>q.id!==id).map(q=>{
+    let ov = 0;
+    for(const w of toks(q.id)) if(myT.has(w)) ov++;
+    const dist = Math.abs(parseInt(q.id,10)-me);
+    const lenDiff = Math.abs(q.a.length-myLen);
+    return {id:q.id, score: ov*3 - dist*0.15 - lenDiff*0.01};
+  }).sort((a,b)=>b.score-a.score);
+  const picks = shuffle(scored.slice(0, 10)).slice(0, 3).map(x=>x.id);
+  return shuffle([id].concat(picks));
 }
 const OPT_LETTERS = ['A','B','C','D'];
+let expandedOpt = null;   // aktuell aufgeklappte Antwortoption
 
 /* ================= Statistik / Pacing ================= */
 function stats(){
@@ -278,11 +295,32 @@ function bumpReviewCount(){
 function applyGrade(id, grade){   // grade: 0 = nicht gewusst, 1 = unsicher, 2 = gewusst
   const c = card(id), heute = todayStr();
   c.seen++;
-  if(grade===0){ c.fail++; c.box = 1; c.due = heute; }
+  if(grade===0){ c.fail++; c.box = 1; c.due = heute; c.lapse = 3; }   // 3x richtig nötig
   else if(grade===1){ c.box = Math.max(1, c.box); c.due = addDays(heute, 1); }
-  else { c.ok++; c.box = Math.min(5, Math.max(1, c.box)+1); c.due = addDays(heute, BOX_INTERVALS[c.box]); }
+  else {
+    c.ok++;
+    if(c.lapse && c.lapse > 1){                       // Fehler-Schuld abtragen, Box bleibt unten
+      c.lapse--; c.box = 1; c.due = heute;
+    } else {
+      c.lapse = 0;
+      c.box = Math.min(5, Math.max(1, c.box)+1); c.due = addDays(heute, BOX_INTERVALS[c.box]);
+    }
+  }
   bumpReviewCount();
   save();
+}
+function markWrong(id){   // nachträglich als falsch werten (auch bei richtiger Antwort)
+  const c = card(id);
+  c.fail++; c.box = 1; c.due = todayStr(); c.lapse = 3;
+  save();
+}
+function requeueCurrent(id){
+  /* Karte, die heute nochmal fällig ist, ein paar Positionen später wieder
+     einreihen (nicht direkt als Nächstes) - mit frisch gemischten Optionen */
+  if(learn.mode==='free') return;
+  if(card(id).due > todayStr()) return;
+  const pos = Math.min(learn.queue.length, learn.idx + 4 + Math.floor(Math.random()*3));
+  learn.queue.splice(pos, 0, id);
 }
 
 /* ================= Navigation ================= */
@@ -478,7 +516,8 @@ function renderLearnCard(){
   const fab=$('#fab'); fab.innerHTML='';
 
   if(mc){
-    /* ---------- Multiple Choice ---------- */
+    /* ---------- Multiple Choice: antippen = auswählen + aufklappen,
+       Auflösung erst nach "Antwort bestätigen" ---------- */
     if(!learn.opts[id]) learn.opts[id] = buildOptions(id);
     const opts = learn.opts[id];
     const box = el('div',{class:'opts'});
@@ -487,20 +526,20 @@ function renderLearnCard(){
       if(learn.revealed){
         if(optId===id) cls += ' correct';
         else if(optId===learn.pick) cls += ' wrong';
-      }
+      } else if(optId===learn.pick) cls += ' sel';
+      const expanded = expandedOpt===optId || (learn.revealed && optId===id);
       const b = el('button',{class:cls});
       b.appendChild(el('span',{class:'lt'},OPT_LETTERS[i]));
-      b.appendChild(el('span',{class:'ot'},esc(optText(optId))));
+      b.appendChild(el('span',{class:'ot'},esc(optText(optId, expanded))));
       if(!learn.revealed){
         b.onclick=()=>{
-          learn.pick = optId; learn.revealed = true;
-          const grade = optId===id ? 2 : 0;
-          applyGrade(id, grade);
-          learn.done['r'+grade]++;
-          if(grade===0 && learn.mode!=='free') learn.queue.push(id);   // gleich nochmal in dieser Runde
+          learn.pick = optId;
+          expandedOpt = optId;      // gewählte Antwort komplett lesbar machen
           renderLearnCard();
         };
-      } else b.disabled = true;
+      } else {
+        b.onclick=()=>{ expandedOpt = (expandedOpt===optId ? null : optId); renderLearnCard(); };
+      }
       box.appendChild(b);
     });
     qc.appendChild(box);
@@ -512,10 +551,39 @@ function renderLearnCard(){
     }
     main.appendChild(qc);
     fab.className='fab';
-    if(learn.revealed){
+    const advance = ()=>{
+      // kommt die Karte später nochmal? Dann Optionen beim nächsten Mal neu mischen
+      if(learn.queue.indexOf(id, learn.idx+1) > -1) delete learn.opts[id];
+      learn.idx++; learn.revealed=false; learn.pick=null; expandedOpt=null;
+      window.scrollTo(0,0); renderLearnCard(); };
+    if(!learn.revealed){
+      if(learn.pick!=null){
+        const b = el('button',{class:'btn-green'},'Antwort bestätigen');
+        b.onclick=()=>{
+          learn.revealed = true;
+          expandedOpt = null;
+          const grade = learn.pick===id ? 2 : 0;
+          applyGrade(id, grade);
+          learn.done['r'+grade]++;
+          requeueCurrent(id);       // falsch oder Fehler-Schuld: später nochmal
+          renderLearnCard();
+        };
+        fab.appendChild(b);
+      }
+    } else {
+      if(learn.pick===id){
+        const bw = el('button',{class:'btn-plain',style:'color:var(--bad)'},'✗ Als falsch werten');
+        bw.onclick=()=>{
+          markWrong(id);
+          learn.done.r2--; learn.done.r0++;
+          requeueCurrent(id);
+          toast('Kommt gleich nochmal – und muss 3× richtig sein.');
+          advance();
+        };
+        fab.appendChild(bw);
+      }
       const b = el('button',{class:'btn-primary'},'Weiter →');
-      b.onclick=()=>{ learn.idx++; learn.revealed=false; learn.pick=null;
-        window.scrollTo(0,0); renderLearnCard(); };
+      b.onclick=advance;
       fab.appendChild(b);
     }
   } else {
@@ -540,7 +608,7 @@ function renderLearnCard(){
       const mk=(cls,txt,sub,grade)=>{ const b=el('button',{class:cls},txt+'<span class="sub">'+sub+'</span>');
         b.onclick=()=>{ applyGrade(id,grade);
           learn.done['r'+grade]++;
-          if(grade===0 && learn.mode!=='free') learn.queue.push(id);   // gleich nochmal in dieser Runde
+          requeueCurrent(id);   // falsch oder Fehler-Schuld: ein paar Karten später nochmal
           learn.idx++; learn.revealed=false;
           window.scrollTo(0,0); renderLearnCard(); };
         return b; };
@@ -677,12 +745,17 @@ function renderExamQ(){
   c.appendChild(qh);
   c.appendChild(el('div',{class:'qtext'},esc(q.q)));
   if(ex.mc){
+    if(renderExamQ._last !== id){ expandedOpt = null; renderExamQ._last = id; }
     const box = el('div',{class:'opts'});
     ex.options[id].forEach((optId,i)=>{
       const b = el('button',{class:'opt'+(ex.answers[id]===optId?' sel':'')});
       b.appendChild(el('span',{class:'lt'},OPT_LETTERS[i]));
-      b.appendChild(el('span',{class:'ot'},esc(optText(optId))));
-      b.onclick=()=>{ ex.answers[id] = (ex.answers[id]===optId ? null : optId); save(); renderExamQ(); };
+      b.appendChild(el('span',{class:'ot'},esc(optText(optId, expandedOpt===optId))));
+      b.onclick=()=>{
+        if(ex.answers[id]===optId){ expandedOpt = (expandedOpt===optId ? null : optId); }
+        else { ex.answers[id] = optId; expandedOpt = optId; save(); }
+        renderExamQ();
+      };
       box.appendChild(b);
     });
     c.appendChild(box);

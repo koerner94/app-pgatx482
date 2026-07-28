@@ -1,5 +1,5 @@
 /* Service Worker: App-Shell cachen, offline nutzbar, Updates bei Netz */
-const CACHE = 'pruefungstrainer-v2';
+const CACHE = 'pruefungstrainer-v3';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 
 self.addEventListener('install', e => {
